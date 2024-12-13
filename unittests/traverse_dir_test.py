@@ -18,9 +18,9 @@ class TestFileSystemAnalysis(unittest.TestCase):
         ]
 
         mock_stat.side_effect = [
-            MagicMock(st_size=5000, st_mode=0o755),  # file1.txt (normal permissions)
+            MagicMock(st_size=5000, st_mode=0o000),  # file1.txt (unusual permissions)
             MagicMock(st_size=10001, st_mode=0o777),  # file2.txt (unusual permissions)
-            MagicMock(st_size=20000, st_mode=0o000),
+            MagicMock(st_size=20000, st_mode=0o755), #file3.txt (usual permission)
         ]
 
 
