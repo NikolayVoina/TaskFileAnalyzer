@@ -1,20 +1,9 @@
 import os
 import stat
+import time
 from collections import defaultdict
+from multiprocessing import Pool, cpu_count
 from typing import Dict, List, Tuple, AnyStr
-import logging
-import concurrent.futures
-import threading
-
-
-"""Logging settings"""
-logging.basicConfig(
-    filename='error_log.txt',
-    level=logging.ERROR,
-    format='%(asctime)s - %(message)s',
-    filemode='w'
-)
-
 
 FILE_CATEGORIES: Dict[str, List[str]] = {
     "text": [".txt", ".log", ".md", ".csv"],
@@ -25,16 +14,67 @@ FILE_CATEGORIES: Dict[str, List[str]] = {
     "archive": [".zip", ".tar", ".gz", ".bz2", ".7z"],
 }
 
-default_size_treshold = 104857600  # 100 MB
+NORMAL_PERMISSIONS = [0o755, 0o644, 0o700, 0o744]
+
+default_size_threshold = 104857600  # 100 MB
 unknown_ext: defaultdict[str, List[str]] = defaultdict(list)
 
 
-"""Semaphore for limiting concurrent threads"""
-semaphore = threading.Semaphore(10)
+def check_permissions(file_path: str) -> List[Tuple[str, str]]:
+    """
+    Check the file permissions and compare them with the standard ones.
+    Return a list of files with unusual permissions.
+
+    Args:
+        file_path (str): Path to the file.
+
+    Returns:
+        List[Tuple[str, str]]: A list of tuples with file path and its unusual permissions.
+    """
+    unusual_permissions = []
+    try:
+        file_permissions = oct(os.stat(file_path).st_mode & 0o777)  # Getting file permission in octal form
+        if int(file_permissions, 8) not in NORMAL_PERMISSIONS:  # Checking permissions in normal permission list
+            unusual_permissions.append((file_path, file_permissions))
+    except OSError as e:
+        handle_os_error(e, file_path)
+    return unusual_permissions
 
 
-"""Sort files by size in descending order"""
+def handle_os_error(e: OSError, file_path: str):
+    """
+    Handle OSError based on its error code and print a detailed error message.
+
+    Args:
+        e (OSError): The OSError exception.
+        file_path (str): Path to the file where the error occurred.
+    """
+    error_messages = {
+        2: f"Error: File or directory does not exist: {file_path}",  # ENOENT (No such file or directory)
+        13: f"Error: Permission denied for file: {file_path}",  # EACCES (Permission denied)
+        9: f"Error: Bad file number for file: {file_path}",  # EBADF (Bad file number)
+        21: f"Error: Trying to open a directory as a file: {file_path}",  # EISDIR (Is a directory)
+        20: f"Error: Not a directory: {file_path}",  # ENOTDIR (Not a directory)
+        25: f"Error: Not a terminal device: {file_path}",  # ENOTTY (Not a typewriter)
+        3: f"Error: No such process while accessing: {file_path}",  # ESRCH (No such process)
+        5: f"Error: I/O error while accessing file: {file_path}",  # EIO (I/O error)
+    }
+
+    # Default error message for unknown error codes
+    message = error_messages.get(e.errno, f"Unexpected error ({e.errno}) with file {file_path}: {e.strerror}")
+    print(message)
+
+
 def quick_sort(files: List[Tuple[str, int]]) -> List[Tuple[str, int]]:
+    """
+    Quick sort implementation to sort files by their size in descending order.
+
+    Args:
+        files (List[Tuple[str, int]]): List of files and their sizes to be sorted.
+
+    Returns:
+        List[Tuple[str, int]]: Sorted list of files by size.
+    """
     if len(files) <= 1:
         return files
     pivot = files[0]
@@ -43,8 +83,18 @@ def quick_sort(files: List[Tuple[str, int]]) -> List[Tuple[str, int]]:
     return quick_sort(larger) + [pivot] + quick_sort(smaller)
 
 
-"""Determine the category of a file based on its extension """
 def get_file_category(filename: str, file_path: str) -> str:
+    """
+    Get the category of the file based on its extension.
+    If the extension is not recognized, classify it as 'other'.
+
+    Args:
+        filename (str): The name of the file.
+        file_path (str): The path to the file.
+
+    Returns:
+        str: The category of the file.
+    """
     _, ext = os.path.splitext(filename)
     for category, extensions in FILE_CATEGORIES.items():
         if ext.lower() in extensions:
@@ -53,65 +103,63 @@ def get_file_category(filename: str, file_path: str) -> str:
     return "other"
 
 
-"""Handle specific OSError and print appropriate messages"""
-def handle_os_error(e: OSError, file_path: str):
-    error_messages = {
-        2: f"Error: File or directory does not exist: {file_path}",  # ENOENT (No such file or directory)
-        13: f"Error: Permission denied for file: {file_path}", # EACCES (Permission denied)
-        9: f"Error: Bad file number for file: {file_path}", # EBADF (Bad file number)
-        21: f"Error: Trying to open a directory as a file: {file_path}", # EISDIR (Is a directory)
-        24: f"Error: Too many open files for file: {file_path}", # EMFILE (Too many open files)
-        20: f"Error: Not a directory: {file_path}", # ENOTDIR (Not a directory)
-        25: f"Error: Not a terminal device: {file_path}", # ENOTTY (Not a typewriter)
-        3: f"Error: No such process while accessing: {file_path}", # ESRCH (No such process)
-        5: f"Error: I/O error while accessing file: {file_path}", # EIO (I/O error)
-    }
+def process_file(file_path: str) -> Tuple[str, int, str, str, List[Tuple[str, str]]]:
+    """
+    Process a single file: calculate its size, determine its category,
+    check its permissions, and identify any unusual permissions.
 
-    # Default error message for unknown error codes
-    message = error_messages.get(e.errno, f"Unexpected error ({e.errno}) with file {file_path}: {e.strerror}")
-    print(message)
-    logging.error(message)
+    Args:
+        file_path (str): The path to the file.
 
-
-"""Helper function for processing each file with semaphore to limit parallelism"""
-def process_file(file: str, root: str, size_threshold: int, categorized_files, total_sizes, unusual_permissions, large_files):
-    with semaphore:
-        try:
-            file_path = os.path.join(root, file)
-            stat_info = os.stat(file_path)
-            size = stat_info.st_size
-            category = get_file_category(file, file_path)
-
-            categorized_files[category].append((file_path, size))
-            total_sizes[category] += size
-
-            # Check for unusual file permissions
-            if stat_info.st_mode & (stat.S_IROTH | stat.S_IWOTH | stat.S_IXOTH):
-                unusual_permissions.append((file_path, oct(stat_info.st_mode)[-3:]))
-
-            # Check for large files
-            if size > size_threshold:
-                large_files.append((file_path, size))
-
-        except OSError as e:
-            handle_os_error(e, file_path)
+    Returns:
+        Tuple[str, int, str, str, List[Tuple[str, str]]]: A tuple with file path, size, category, permissions,
+        and unusual permissions.
+    """
+    try:
+        size = os.path.getsize(file_path)
+        category = get_file_category(file_path, file_path)
+        file_permissions = os.stat(file_path).st_mode & 0o777
+        unusual_permissions = check_permissions(file_path)
+        return file_path, size, category, oct(file_permissions), unusual_permissions
+    except OSError as e:
+        handle_os_error(e, file_path)
+        return file_path, 0, "unknown", "", []
 
 
-"""Traverse the directory and categorize files"""
-def traverse_directory(directory: str, size_threshold: int) -> Tuple[Dict[str, List[Tuple[str, int]]], Dict[str, int], List[Tuple[str, str]], List[Tuple[str, int]]]:
+def traverse_directory_mp(directory: str, size_threshold: int):
+    """
+    Traverse the directory and analyze its files in parallel using multiple processes.
+    Categorize files, check for unusual permissions, and identify large files.
+
+    Args:
+        directory (str): The directory to traverse.
+        size_threshold (int): The size threshold for large files.
+
+    Returns:
+        Tuple: A tuple containing categorized files, total sizes, unusual permissions, and large files.
+    """
     categorized_files: defaultdict[str, List[Tuple[str, int]]] = defaultdict(list)
     total_sizes: defaultdict[str, int] = defaultdict(int)
     unusual_permissions: List[Tuple[str, str]] = []
     large_files: List[Tuple[str, int]] = []
 
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = []
-        for root, _, files in os.walk(directory):
-            for file in files:
-                futures.append(executor.submit(process_file, file, root, size_threshold, categorized_files, total_sizes, unusual_permissions, large_files))
+    files = []
+    for root, _, filenames in os.walk(directory):
+        for filename in filenames:
+            files.append(os.path.join(root, filename))
 
-        # Wait for all futures to complete
-        concurrent.futures.wait(futures)
+    with Pool(processes=cpu_count()) as pool:
+        results = pool.map(process_file, files)
+
+    for file_path, size, category, permissions, unusual_perms in results:
+        if size is not None:
+            categorized_files[category].append((file_path, size))
+            total_sizes[category] += size
+
+            if size > size_threshold:
+                large_files.append((file_path, size))
+
+            unusual_permissions.extend(unusual_perms)
 
     for category in categorized_files:
         categorized_files[category] = quick_sort(categorized_files[category])
@@ -119,9 +167,18 @@ def traverse_directory(directory: str, size_threshold: int) -> Tuple[Dict[str, L
     return categorized_files, total_sizes, unusual_permissions, large_files
 
 
-"""Display the categorized files, unusual permissions, and large files"""
 def display_results(categorized_files: Dict[str, List[Tuple[str, int]]], total_sizes: Dict[str, int],
                     unusual_permissions: List[Tuple[str, str]], large_files: List[Tuple[str, int]]):
+    """
+    Display the categorized files, files with unusual permissions,
+    and files that exceed the size threshold.
+
+    Args:
+        categorized_files (Dict[str, List[Tuple[str, int]]]): Categorized files and their sizes.
+        total_sizes (Dict[str, int]): Total size of files in each category.
+        unusual_permissions (List[Tuple[str, str]]): List of files with unusual permissions.
+        large_files (List[Tuple[str, int]]): List of large files exceeding the size threshold.
+    """
     print("\nFile Type Categorization")
     print("=" * 50)
     for category, files in categorized_files.items():
@@ -137,42 +194,51 @@ def display_results(categorized_files: Dict[str, List[Tuple[str, int]]], total_s
     for i, (file, size) in enumerate(large_files, 1):
         print(f"{i}. {file} ({size} bytes)")
 
-    print("\nOther Extension: ")
+    print("\nOther Extensions:")
     print("=" * 50)
     if unknown_ext:
-        print("Other extensions found:", end="")
         for ext, files in unknown_ext.items():
-            print(f"\nExtension: {ext}")
+            print(f"Extension: {ext}")
             for file in files:
                 print(f"  - {file}")
 
 
-"""Prompt the user for valid input (directory and size threshold)"""
 def get_valid_input() -> Tuple[str, int]:
+    """
+    Prompt the user to enter a valid directory path and file size threshold.
+    If invalid input is provided, the function will keep prompting the user.
+
+    Returns:
+        Tuple[str, int]: The directory path and the size threshold.
+    """
     while True:
         try:
             directory = input("Enter the directory to analyze: ").strip()
-
-            if directory == "1":
-                exit(0)
 
             if not os.path.isdir(directory):
                 raise ValueError("Directory does not exist.")
 
             size_threshold = input(
-                f"Enter size threshold for large files (in bytes, default {default_size_treshold}): ").strip()
+                "Enter the size threshold for large files in bytes (default 100 MB): ").strip()
 
-            size_threshold = int(size_threshold) if size_threshold else default_size_treshold
+            if not size_threshold:
+                size_threshold = default_size_threshold
+            else:
+                size_threshold = int(size_threshold)
+
             return directory, size_threshold
-
-        except ValueError as e:
-            print(f"Error: {e}. Please try again.")
+        except (ValueError, FileNotFoundError) as e:
+            print(f"Invalid input: {e}. Please try again.")
 
 
 if __name__ == "__main__":
     while True:
-        print("If u want exit press '1'")
+        start_time: time = time.time()
+        print("If you want to exit, press '1'")
         directory, size_threshold = get_valid_input()
         print("Analyzing directory...")
-        categorized_files, total_sizes, unusual_permissions, large_files = traverse_directory(directory, size_threshold)
+        categorized_files, total_sizes, unusual_permissions, large_files = traverse_directory_mp(directory, size_threshold)
         display_results(categorized_files, total_sizes, unusual_permissions, large_files)
+        finish_time: time = time.time()
+        print("This iteration took", finish_time - start_time)
+        print("*" * 50)

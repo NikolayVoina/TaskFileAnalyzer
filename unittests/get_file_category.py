@@ -1,3 +1,4 @@
+import os
 import unittest
 from task_analyzer import get_file_category
 
